@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Communicate with Dovado router
@@ -7,7 +7,9 @@ Usage:
   dovado.py (-h | --help)
   dovado.py --version
   dovado.py [-v|-vv] [options] (state | info | services | traffic | help)
-  dovado.py [-v|-vv] [options] sms <number> <message>
+  dovado.py [-v|-vv] [options] sms
+  dovado.py [-v|-vv] [options] sms_send <number> <message>
+  dovado.py [-v|-vv] [options] sms_recv [<sms_id>]
 
 Options:
   -u <username>, --username=<username> Dovado router username
@@ -26,6 +28,7 @@ from contextlib import contextmanager, closing
 from curses.ascii import ETB
 import telnetlib
 import json
+from base64 import b64encode
 from sys import argv
 from os.path import dirname, expanduser, join
 from os import environ
@@ -68,11 +71,14 @@ class Dovado():
         self._port = int(port or DEFAULT_PORT)
         self._connection = None
 
-    def _until(self, what):
+    def _until(self, what, encoding='utf-8', decoding='ascii'):
         """Wait for response."""
-        what = what.encode('utf-8')
+        if encoding:
+            what = what.encode(encoding)
         ret = self._connection.read_until(what, timeout=TIMEOUT.seconds)
-        return ret.decode('ascii')
+        if decoding:
+            return ret.decode(decoding)
+        return ret
 
     def _write(self, what):
         """Write data to connection."""
@@ -80,20 +86,30 @@ class Dovado():
         self._connection.write(what.encode('utf-8'))
 
     def _send(self, *cmd):
-        """Send command to router."""
+        """Send command to router. Response must be read with _read() or manually."""
         cmd = ' '.join(cmd)
         cursor = '>> '
         ret = self._until('\n')
         _log('(skipping)', ret)
         ret = self._until(cursor)
         self._write(cmd + '\n')
-        ret = self._until(chr(ETB))[:-1]
+
+    def _read(self, until=chr(ETB)):
+        ret = self._until(until)[:-1]
         _log('recv', ret)
         return ret
 
+    def _readline(self):
+        return self._read(until="\n")
+
+    def _execute(self, *cmd):
+        """Send command to router and return response."""
+        self._send(*cmd)
+        return self._read()
+
     def _parse_query(self, cmd):
         """Make query and convert response into dict."""
-        res = self._send(cmd)
+        res = self._execute(cmd)
         res = [item.split('=')
                for item in res.splitlines()]
         res = [item[0].split(':')
@@ -132,12 +148,12 @@ class Dovado():
                                self._port):
                 _LOGGER.debug('Connected, logging in as user %s',
                               self._username)
-                ret = self._send('user', self._username)
+                ret = self._execute('user', self._username)
                 _expect('Hello' in ret, 'User unknown')
-                ret = self._send('pass', self._password)
+                ret = self._execute('pass', self._password)
                 _expect('Access granted' in ret, 'Could not authenticate')
                 yield
-                self._send('quit')
+                self._execute('quit')
         except (RuntimeError, OSError, IOError, EOFError) as error:
             _LOGGER.warning('Could not communicate with %s@%s:%d: %s',
                             self._username, self._hostname, self._port, error)
@@ -146,10 +162,43 @@ class Dovado():
     def send_sms(self, number, message):
         """Send SMS through the router."""
         with self.session():
-            res = self._send('sms sendtxt %s' % number)
+            res = self._execute('sms', 'sendtxt', number)
             if 'Start sms input' in res:
                 self._write('%s\n.\n' % message)
                 return True
+
+    def del_sms(self, sms_id):
+        with self.session():
+            self._execute('sms', 'del', sms_id)
+
+    def recv_sms(self, sms_id):
+        """Recv SMS from router inbox."""
+        with self.session():
+            list_res = self._execute('sms', 'list').split("\n")
+            (unread, total) = list_res[1].split('/')
+            avail_ids = list_res[2].split(':')[1].strip().split()
+            cmd = ['sms', 'recvtxt']
+            to_read = avail_ids
+            if sms_id is not None:
+                cmd.append(sms_id)
+                to_read = [sms_id]
+            self._send(*cmd)
+            msgs = []
+            for i in to_read:
+                # TODO(jpg): read until \n\n and parse as dict instead
+                decodings = {"UTF-8": 'utf-8', "binary": None}
+                headers = self._read(until="\n\n")
+                msg = dict(x.split(': ') for x in headers.strip().splitlines())
+                alpha = msg.get("Alphabet", "UTF-8")
+                end = "\nEnd of SMS\n".encode('ascii')
+                sms_content = self._connection.read_until(end, timeout=TIMEOUT.seconds)[:-len(end)]
+                if decodings[alpha]:
+                    sms_content = sms_content.decode(decodings[alpha])
+                if alpha == "binary":
+                    sms_content = b64encode(sms_content).decode('ascii')
+                msg['content'] = sms_content
+                msgs.append(msg)
+            return msgs
 
     def query(self, command, parse_response=True):
         """Send query to server."""
@@ -157,7 +206,7 @@ class Dovado():
             if parse_response:
                 return self._parse_query(command)
             else:
-                return self._send(command)
+                return self._execute(command)
 
     @property
     def state(self):
@@ -179,7 +228,6 @@ def _read_credentials():
                          join(expanduser('~'), '.config')),
              'dovado.conf')]:
         try:
-            print(path, filename)
             with open(join(path, filename)) as config:
                 return dict(x.split(': ')
                             for x in config.read().strip().splitlines()
@@ -220,6 +268,8 @@ def main():
         """Print object."""
         if isinstance(obj, dict):
             print(json.dumps(obj, indent=2))
+        elif isinstance(obj, list):
+            print(json.dumps(obj, indent=2))
         else:
             print(obj)
 
@@ -235,7 +285,11 @@ def main():
         elif args['traffic']:
             emit(dovado.query('traffic', parse_response=False))
         elif args['sms']:
+            emit(dovado.query('sms list', parse_response=False))
+        elif args['sms_send']:
             dovado.send_sms(args['<number>'], args['<message>'])
+        elif args['sms_recv']:
+            emit(dovado.recv_sms(args['<sms_id>']))
     except (RuntimeError, OSError, IOError, EOFError) as e:
         exit('Failed to contact router: %s' % e.message)
 
